@@ -222,6 +222,10 @@ struct BuildResult final {
     // end-of-match, so wireMatchAndMidSources must NOT add the main
     // termVtxp -> matchVertex Link (would double-count via the merge vertex).
     bool termIsMidMerge = false;
+    // Empty match of a zero-minimum repetition (IEEE 1800-2023 16.9.2.1), only when the
+    // enclosing SExpr asked for it: the empty match ends one tick before this vertex, so
+    // a following ##K continues from here with K-1 delays (and ##0 drops it).
+    SvaStateVertex* emptyEarlyp = nullptr;
     bool valid() const { return termVertexp != nullptr; }
     static BuildResult fail(bool errored = false) { return {nullptr, nullptr, {}, errored}; }
     static BuildResult failWithError() { return {nullptr, nullptr, {}, true}; }
@@ -333,6 +337,7 @@ class SvaNfaBuilder final {
     // Unsupported endpoint topology must reject, not ignore, or the wait hangs
     bool m_isSeqEvent = false;
     bool m_inSequencePrefix = false;  // Prefix composition does not preserve every endpoint
+    bool m_wantEmptyEarly = false;  // Enclosing SExpr consumes a zero-min repetition's empty match
 
     struct RangeDelayRejectInfo final {
         SvaStateVertex* startp = nullptr;
@@ -683,7 +688,7 @@ class SvaNfaBuilder final {
     }
 
     BuildResult buildSExpr(AstSExpr* sexprp, SvaStateVertex* entryVtxp,
-                           bool isTopLevelStep = false) {
+                           bool isTopLevelStep = false, bool wantEmptyEarly = false) {
         AstDelay* const delayp = VN_CAST(sexprp->delayp(), Delay);
         if (!delayp || !delayp->isCycleDelay()) return BuildResult::fail();
 
@@ -692,10 +697,17 @@ class SvaNfaBuilder final {
 
         // Handle LHS (preExpr)
         SvaStateVertex* currentp = entryVtxp;
+        SvaStateVertex* preEmptyEarlyp = nullptr;
         if (AstNodeExpr* const preExprp = sexprp->preExprp()) {
             VL_RESTORER(m_inSequencePrefix);
             m_inSequencePrefix = true;
-            const BuildResult pre = buildExpr(preExprp, currentp, isTopLevelStep);
+            BuildResult pre;
+            {
+                VL_RESTORER(m_wantEmptyEarly);
+                m_wantEmptyEarly = true;
+                pre = buildExpr(preExprp, currentp, isTopLevelStep);
+            }
+            preEmptyEarlyp = pre.emptyEarlyp;
             if (!pre.valid()) return BuildResult::fail(pre.errorEmitted);  // LCOV_EXCL_LINE
             if (pre.finalCondp) {
                 SvaStateVertex* const condVtxp = scopedCreateVertex();
@@ -723,12 +735,37 @@ class SvaNfaBuilder final {
             }
         } else {
             const unsigned delayCycles = getConstUInt(delayp->lhsp());
-            currentp = addDelayChain(currentp, delayCycles, flp);
+            SvaStateVertex* const mainp = addDelayChain(currentp, delayCycles, flp);
+            if (preEmptyEarlyp && delayCycles > 0) {
+                // (empty ##K seq) is (##(K-1) seq); (empty ##0 seq) never matches.
+                SvaStateVertex* const emptyp = addDelayChain(preEmptyEarlyp, delayCycles - 1, flp);
+                SvaStateVertex* const mergep = scopedCreateVertex();
+                guardedLink(mainp, mergep, flp);
+                guardedLink(emptyp, mergep, flp);
+                currentp = mergep;
+            } else {
+                currentp = mainp;
+            }
+        }
+        if (preEmptyEarlyp && delayp->isRangeDelay()) {
+            sexprp->v3warn(E_UNSUPPORTED, "Unsupported: range cycle delay after a zero-minimum"
+                                          " repetition (IEEE 1800-2023 16.9.2.1)");
+            return BuildResult::failWithError();
         }
 
         // Multi-cycle RHS: recurse (only plain boolean is returned as finalCondp).
         if (exprp->isMultiCycleSva()) {
-            const BuildResult result = buildExpr(exprp, currentp, isTopLevelStep);
+            // An empty RHS match ends before this element: keep it for an enclosing ##K
+            // to consume; after ##0 it never matches (seq ##0 empty), so drop it.
+            const bool fixedDelay = !delayp->isRangeDelay();
+            const bool zeroDelay = fixedDelay && getConstUInt(delayp->lhsp()) == 0;
+            BuildResult result;
+            {
+                VL_RESTORER(m_wantEmptyEarly);
+                m_wantEmptyEarly = fixedDelay && (wantEmptyEarly || zeroDelay);
+                result = buildExpr(exprp, currentp, isTopLevelStep);
+            }
+            if (zeroDelay) result.emptyEarlyp = nullptr;
             if (result.valid()) addFiniteRangeReject(rangeRejectInfo, result, flp);
             return result;
         }
@@ -736,7 +773,7 @@ class SvaNfaBuilder final {
     }
 
     BuildResult buildConsRep(AstSConsRep* repp, SvaStateVertex* entryVtxp,
-                             bool isTopLevelStep = false) {
+                             bool isTopLevelStep = false, bool wantEmptyEarly = false) {
         FileLine* const flp = repp->fileline();
         AstNodeExpr* const exprp = repp->exprp();
         // Multi-cycle expr in ConsRep not yet supported; bail to avoid invalid AST.
@@ -745,7 +782,15 @@ class SvaNfaBuilder final {
                                         " consecutive repetition (IEEE 1800-2023 16.9.2)");
             return BuildResult::failWithError();
         }
-        const unsigned minN = getConstUInt(repp->countp());
+        const unsigned rawMinN = getConstUInt(repp->countp());
+        // expr[*0:n] / expr[*0:$] is the empty match or expr[*1:n] / expr[*1:$]. The first
+        // optional occurrence is checked on the entry tick like a required one; the empty
+        // match is reported separately (emptyEarlyp) because it ends before the entry tick.
+        const bool splitEmpty
+            = rawMinN == 0 && !m_isCoverSeq
+              && (repp->unbounded()
+                  || (repp->maxCountp() && getConstUInt(repp->maxCountp()) >= 1));
+        const unsigned minN = splitEmpty ? 1 : rawMinN;
 
         // Sum sites across prefix + unbounded/range tail so one hoist covers
         // every check edge of this repetition.
@@ -781,7 +826,7 @@ class SvaNfaBuilder final {
                 = guardedLink(currentp, condVtxp, sampledRefOrClone(hoistVarp, exprp, flp), flp);
             // Only an outermost required step rejects the property. Its first check is explicit,
             // later required checks reject through the ring's throughout guard.
-            if (isTopLevelStep && i == 0) linkp->m_rejectOnFail = true;
+            if (isTopLevelStep && i == 0 && !splitEmpty) linkp->m_rejectOnFail = true;
             currentp = condVtxp;
         }
         // After minN: currentp is the first valid end-of-match position for [*m:n].
@@ -841,10 +886,24 @@ class SvaNfaBuilder final {
             }
             currentp = mergeVtxp;
         }
+        SvaStateVertex* emptyEarlyp = nullptr;
+        if (splitEmpty) {
+            if (wantEmptyEarly) {
+                emptyEarlyp = entryVtxp;
+            } else {
+                // No enclosing ##K to consume it: keep the empty endpoint on the entry tick.
+                SvaStateVertex* const mergep = scopedCreateVertex();
+                guardedLink(currentp, mergep, flp);
+                guardedLink(entryVtxp, mergep, flp);
+                mergep->m_isUnbounded = currentp->m_isUnbounded;
+                currentp = mergep;
+            }
+        }
         // finalCond = nullptr (already checked via Links)
         BuildResult res;
         res.termVertexp = currentp;
         res.finalCondp = nullptr;
+        res.emptyEarlyp = emptyEarlyp;
         res.midSources = std::move(consMidSources);
         // mergeVtxp is the OR of all the end-positions we already pushed to
         // midSources, so the main termVtxp -> matchVertex Link would duplicate.
@@ -1604,11 +1663,14 @@ public:
 
     BuildResult buildExpr(AstNodeExpr* nodep, SvaStateVertex* entryVtxp,
                           bool isTopLevelStep = false) {
+        VL_RESTORER(m_wantEmptyEarly);
+        const bool wantEmptyEarly = m_wantEmptyEarly;
+        m_wantEmptyEarly = false;
         if (AstSExpr* const sexprp = VN_CAST(nodep, SExpr)) {
-            return buildSExpr(sexprp, entryVtxp, isTopLevelStep);
+            return buildSExpr(sexprp, entryVtxp, isTopLevelStep, wantEmptyEarly);
         }
         if (AstSConsRep* const repp = VN_CAST(nodep, SConsRep)) {
-            return buildConsRep(repp, entryVtxp, isTopLevelStep);
+            return buildConsRep(repp, entryVtxp, isTopLevelStep, wantEmptyEarly);
         }
         if (AstPropAlways* const alwaysp = VN_CAST(nodep, PropAlways)) {
             return buildPropAlways(alwaysp, entryVtxp, isTopLevelStep);
